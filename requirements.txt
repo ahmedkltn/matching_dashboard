@@ -1,0 +1,6 @@
+dash
+dash-table
+pandas
+plotly
+altair
+streamlit
