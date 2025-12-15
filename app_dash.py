@@ -486,6 +486,8 @@ app.layout = html.Div(
                             ],
                             **COMMON_TABLE_PROPS,
                             page_size=12,
+                            export_format="csv",
+
                         ),
                     ],
                     className="card",
