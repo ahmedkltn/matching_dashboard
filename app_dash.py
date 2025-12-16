@@ -405,7 +405,7 @@ app.layout = html.Div(
                     [
                         dcc.Checklist(
                             id="toggle-remove-invalid",
-                            options=[{"label": "Remove invalid links (row_count > 1)", "value": "on"}],
+                            options=[{"label": "Remove invalid links", "value": "on"}],
                             value=["on"],
                             labelStyle={"display": "inline-block", "marginRight": "12px"},
                         ),
