@@ -3,60 +3,34 @@ import io
 import re
 from typing import Optional, Tuple
 
-from dash import Dash, Input, Output, State, callback, dcc, html
-from dash import dash_table
 import pandas as pd
 import plotly.express as px
+from dash import Dash, Input, Output, State, callback, dcc, html
+from dash import dash_table
 
 
 # --------- Helpers for reading & cleaning data --------- #
 
-
-def build_comp_key_mapping(
-    offline_keys: list[str], looker_keys: list[str]
-) -> dict[str, str]:
-    """
-    Map looker comp_keys to offline comp_keys when they are clearly variants.
-
-    Logic:
-      - Take offline comp_key list as the reference.
-      - For each looker_key, find offline_key where:
-           - one is a prefix of the other, AND
-           - the shorter key length >= 4 (to avoid too-aggressive merges like 'max' -> 'maxilia').
-      - If exactly one such offline candidate exists, map looker_key -> that offline_key.
-      - Otherwise, keep looker_key as-is.
-    """
+def build_comp_key_mapping(offline_keys: list[str], looker_keys: list[str]) -> dict[str, str]:
     mapping: dict[str, str] = {}
-
     offline_set = list(dict.fromkeys(offline_keys))  # unique, preserve order
 
     for lk in looker_keys:
         candidates = []
         for ok in offline_set:
             shorter, longer = (ok, lk) if len(ok) <= len(lk) else (lk, ok)
-
             if len(shorter) >= 4 and longer.startswith(shorter):
                 candidates.append(ok)
-
-        if len(candidates) == 1:
-            # clear match: align looker key to this offline key
-            mapping[lk] = candidates[0]
-        else:
-            # ambiguous or no match: leave as-is
-            mapping[lk] = lk
+        mapping[lk] = candidates[0] if len(candidates) == 1 else lk
 
     return mapping
 
 
 def parse_contents(contents: Optional[str]) -> pd.DataFrame:
-    """
-    Decode uploaded Dash dcc.Upload contents into a DataFrame.
-    Returns empty DF with expected columns if no content.
-    """
     if contents is None:
         return pd.DataFrame(columns=["Competitor", "SKU"])
 
-    content_type, content_string = contents.split(",")
+    _, content_string = contents.split(",")
     decoded = base64.b64decode(content_string)
 
     for encoding in ("utf-8", "latin-1"):
@@ -65,20 +39,26 @@ def parse_contents(contents: Optional[str]) -> pd.DataFrame:
         except UnicodeDecodeError:
             continue
 
-    # Fallback
     return pd.DataFrame(columns=["Competitor", "SKU"])
 
 
 def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalize column names, enforce required columns,
-    strip whitespace and drop duplicates / nulls.
-    Keeps extra columns like URL if present.
+    Keeps extra columns if present (e.g. URL, row_count).
     """
     if df.empty:
         return pd.DataFrame(columns=["Competitor", "SKU"])
 
-    df = df.rename(columns={c: c.strip() for c in df.columns})
+    df = df.rename(columns={c: c.strip().lower() for c in df.columns})
+    df = df.rename(
+        columns={
+            "competitor": "Competitor",
+            "sku": "SKU",
+            "url": "URL",
+            # row_count remains as "row_count" if present
+        }
+    )
+
     expected = {"Competitor", "SKU"}
     if not expected.issubset(df.columns):
         return pd.DataFrame(columns=["Competitor", "SKU"])
@@ -88,6 +68,38 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.dropna(subset=["Competitor", "SKU"]).drop_duplicates(subset=["Competitor", "SKU"])
     return df
+
+
+def split_invalid_links(off_df: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
+    """
+    Invalid links are offline rows where row_count == 1.
+    Returns (invalid_df, msg).
+    """
+    if "row_count" not in off_df.columns:
+        return pd.DataFrame(columns=["Competitor", "SKU", "URL"]), "No row_count column provided"
+
+    rc = pd.to_numeric(off_df["row_count"], errors="coerce")
+    invalid_df = off_df[rc == 1].copy()
+
+    if "URL" not in invalid_df.columns:
+        invalid_df["URL"] = ""
+
+    return invalid_df, None
+
+
+def apply_remove_invalid_toggle(off_df: pd.DataFrame, remove_invalid: bool) -> pd.DataFrame:
+    """
+    If remove_invalid is True and row_count exists: keep only row_count > 1
+    Otherwise: return full off_df.
+    """
+    if not remove_invalid:
+        return off_df
+
+    if "row_count" not in off_df.columns:
+        return off_df
+
+    rc = pd.to_numeric(off_df["row_count"], errors="coerce")
+    return off_df[rc > 1].copy()
 
 
 # --------- Competitor name normalization / alignment --------- #
@@ -100,63 +112,34 @@ _COUNTRY_TOKENS = {
 
 
 def normalize_competitor_name(name: str) -> str:
-    """
-    Build a 'fuzzy' competitor key to allow flexible matching.
-    Example:
-        'Maxilia DE'     -> 'maxilia'
-        'MAXILIA.de'     -> 'maxilia'
-        'Maxilia-Italia' -> 'maxiliaitalia'  (spaces removed)
-    """
     s = str(name).lower().strip()
-
-    # Replace punctuation commonly used around country codes
     s = re.sub(r"[._\-()+,]", " ", s)
-
-    # Collapse repeated whitespace
     s = re.sub(r"\s+", " ", s)
 
     tokens = s.split()
-    # Drop tokens that look like 2-letter country codes
     tokens = [t for t in tokens if t not in _COUNTRY_TOKENS]
-
     if not tokens:
         tokens = [s]
-
-    # Join without spaces
-    norm = "".join(tokens).strip()
-    return norm
+    return "".join(tokens).strip()
 
 
-def align_competitors(
-    off_df: pd.DataFrame, look_df: pd.DataFrame
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Add a 'comp_key' to both offline and looker dataframes for matching.
-
-    Enforces *inner join on competitors*:
-      - Only keep rows whose comp_key exists in BOTH offline and looker.
-      - Also return offline competitors that had no matching comp_key in Looker.
-    """
+def align_competitors(off_df: pd.DataFrame, look_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     off_df = off_df.copy()
     look_df = look_df.copy()
 
-    # Normalize to comp_key
     off_df["comp_key"] = off_df["Competitor"].apply(normalize_competitor_name)
     look_df["comp_key"] = look_df["Competitor"].apply(normalize_competitor_name)
 
-    # Map looker keys to offline keys
     offline_keys = sorted(off_df["comp_key"].dropna().unique())
     looker_keys = sorted(look_df["comp_key"].dropna().unique())
     key_mapping = build_comp_key_mapping(offline_keys, looker_keys)
     look_df["comp_key"] = look_df["comp_key"].map(key_mapping).fillna(look_df["comp_key"])
 
-    # Inner join on comp_key
     off_keys = set(off_df["comp_key"].dropna().unique())
     look_keys = set(look_df["comp_key"].dropna().unique())
     common_keys = off_keys & look_keys
     offline_only_keys = off_keys - look_keys
 
-    # Offline competitors that don't exist in Looker (for debug / summary)
     unmatched_offline = (
         off_df[off_df["comp_key"].isin(offline_only_keys)][["Competitor", "comp_key"]]
         .drop_duplicates()
@@ -172,25 +155,10 @@ def align_competitors(
 
 # --------- Metrics / charts --------- #
 
-def compute_metrics(
-    off_df: pd.DataFrame, look_df: pd.DataFrame
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Core business logic:
-      - Align competitor names via comp_key.
-      - Inner join competitors (comp_key).
-      - Left-join Offline to Looker on (comp_key, SKU).
-      - Compute:
-         * merged row-level table with FoundInLooker flag
-         * competitor-level stats
-         * global summary stats (including competitor counts)
-         * offline-only competitors (unmatched_offline)
-    """
+def compute_metrics(off_df: pd.DataFrame, look_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     off_df, look_df, unmatched_offline = align_competitors(off_df, look_df)
 
-    look_slim = look_df[["comp_key", "SKU", "Competitor"]].rename(
-        columns={"Competitor": "Competitor_Looker"}
-    )
+    look_slim = look_df[["comp_key", "SKU", "Competitor"]].rename(columns={"Competitor": "Competitor_Looker"})
 
     merged = off_df.merge(
         look_slim,
@@ -220,9 +188,6 @@ def compute_metrics(
     missing_global = total_offline - total_looker
     loss_pct_global = round((missing_global / total_offline) * 100, 2) if total_offline else 0.0
 
-    offline_comp_count = off_df["Competitor"].nunique()
-    looker_comp_count = look_df["Competitor"].nunique()
-
     global_stats = pd.DataFrame(
         {
             "metric": [
@@ -238,8 +203,8 @@ def compute_metrics(
                 total_looker,
                 missing_global,
                 loss_pct_global,
-                offline_comp_count,
-                looker_comp_count,
+                off_df["Competitor"].nunique(),
+                look_df["Competitor"].nunique(),
             ],
         }
     )
@@ -263,12 +228,6 @@ def metric_cards(stats: pd.DataFrame):
 
 
 def comp_stack_chart(comp_stats: pd.DataFrame):
-    """
-    Stacked counts per competitor:
-      - found_in_looker
-      - missing
-    Sum = total offline SKUs per competitor.
-    """
     if comp_stats.empty:
         return {}
 
@@ -286,17 +245,54 @@ def comp_stack_chart(comp_stats: pd.DataFrame):
         color="status",
         barmode="stack",
         labels={"sku_count": "Number of SKUs", "status": "Status"},
-        hover_data={
-            "offline_skus": True,
-            "loss_pct": True,
-            "status": True,
-            "sku_count": True,
-        },
+        hover_data={"offline_skus": True, "loss_pct": True, "status": True, "sku_count": True},
     )
     fig.update_layout(
         margin=dict(l=10, r=10, t=30, b=10),
         xaxis_title="Competitor (Offline)",
         yaxis_title="Offline SKUs (Found + Missing)",
+        plot_bgcolor="#FFFFFF",
+        paper_bgcolor="#FFFFFF",
+        font=dict(color="#111827"),
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(gridcolor="#E5E7EB")
+    return fig
+
+
+def invalid_links_bar_chart(invalid_df: pd.DataFrame, selected_comp: str | None):
+    if invalid_df is None or invalid_df.empty:
+        return {}
+
+    counts = (
+        invalid_df.groupby("Competitor", dropna=False)
+        .size()
+        .reset_index(name="invalid_count")
+        .sort_values("invalid_count", ascending=False)
+    )
+
+    # Highlight selection by changing opacity
+    if selected_comp:
+        counts["is_selected"] = counts["Competitor"].eq(selected_comp)
+        counts["opacity"] = counts["is_selected"].map({True: 1.0, False: 0.25})
+    else:
+        counts["opacity"] = 1.0
+
+    fig = px.bar(
+        counts,
+        x="Competitor",
+        y="invalid_count",
+        labels={"invalid_count": "Invalid links (row_count = 1)"},
+        hover_data={"opacity": False},
+    )
+
+    # Apply per-bar opacity
+    fig.update_traces(marker={"opacity": counts["opacity"].tolist()})
+
+    fig.update_layout(
+        margin=dict(l=10, r=10, t=30, b=10),
+        xaxis_title="Competitor",
+        yaxis_title="Invalid links",
         plot_bgcolor="#FFFFFF",
         paper_bgcolor="#FFFFFF",
         font=dict(color="#111827"),
@@ -322,40 +318,26 @@ COMMON_TABLE_PROPS = dict(
         "marginTop": "8px",
     },
     style_header={
-        "backgroundColor": "#F3F4F6",   # light gray
-        "color": "#111827",             # dark text
+        "backgroundColor": "#F3F4F6",
+        "color": "#111827",
         "fontWeight": "600",
         "border": "none",
     },
     style_cell={
         "padding": "8px 10px",
         "borderBottom": "1px solid #E5E7EB",
-        "fontFamily": (
-            "system-ui, -apple-system, BlinkMacSystemFont, "
-            "'Segoe UI', sans-serif"
-        ),
+        "fontFamily": "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
         "fontSize": "13px",
         "whiteSpace": "nowrap",
         "textOverflow": "ellipsis",
         "maxWidth": 0,
-        "color": "#111827",             # dark text color
-        "backgroundColor": "#FFFFFF",   # white background
+        "color": "#111827",
+        "backgroundColor": "#FFFFFF",
     },
     style_data_conditional=[
-        {
-            "if": {"row_index": "odd"},
-            "backgroundColor": "#FAFAFA",   # subtle zebra effect
-        },
-        {
-            "if": {"state": "active"},
-            "backgroundColor": "#EFF6FF",
-            "border": "1px solid #2563EB",
-        },
-        {
-            "if": {"state": "selected"},
-            "backgroundColor": "#DBEAFE",
-            "border": "1px solid #2563EB",
-        },
+        {"if": {"row_index": "odd"}, "backgroundColor": "#FAFAFA"},
+        {"if": {"state": "active"}, "backgroundColor": "#EFF6FF", "border": "1px solid #2563EB"},
+        {"if": {"state": "selected"}, "backgroundColor": "#DBEAFE", "border": "1px solid #2563EB"},
     ],
 )
 
@@ -368,12 +350,15 @@ app.layout = html.Div(
     [
         dcc.Store(id="offline-data"),
         dcc.Store(id="looker-data"),
+        dcc.Store(id="offline-invalid-data"),  # invalid rows (row_count == 1) only
+
         html.H1("Match Coverage Dashboard", className="app-title"),
         html.P(
             "Compare offline matched SKUs vs Looker scraped SKUs to quantify coverage and losses. "
             "Competitor names are matched flexibly (e.g. 'maxilia DE' vs 'maxilia').",
             className="app-subtitle",
         ),
+
         html.Div(
             [
                 html.Div(
@@ -401,38 +386,45 @@ app.layout = html.Div(
             ],
             className="uploader-row",
         ),
+
         html.Div(
             [
-                html.Div(
-                    "Sample files: data/sample_offline.csv, data/sample_looker.csv",
-                    className="sample-hint",
-                ),
+                html.Div("Sample files: data/sample_offline.csv, data/sample_looker.csv", className="sample-hint"),
                 html.Div(id="upload-status", className="upload-status"),
             ],
             style={"marginTop": "8px"},
         ),
-        # NEW: summary of rows + offline-only competitors
+
+        html.Div(id="upload-summary", className="upload-summary", style={"marginTop": "4px"}),
+
+        # Toggle (default ON)
         html.Div(
-            id="upload-summary",
-            className="upload-summary",
-            style={"marginTop": "4px"},
+            [
+                html.H3("Data Filters", className="section-title"),
+                html.Div(
+                    [
+                        dcc.Checklist(
+                            id="toggle-remove-invalid",
+                            options=[{"label": "Remove invalid links (row_count > 1)", "value": "on"}],
+                            value=["on"],
+                            labelStyle={"display": "inline-block", "marginRight": "12px"},
+                        ),
+                    ],
+                    className="card",
+                    style={"padding": "10px 12px"},
+                ),
+            ],
+            style={"marginTop": "12px"},
         ),
 
-        # Overall metrics cards
         html.H3("Overall", className="section-title"),
         html.Div(id="global-cards", className="metrics-row"),
 
-        # Distinct SKUs as cards
         html.H3("Distinct Values (Offline vs Looker)", className="section-title"),
         html.Div(id="distinct-cards", className="metrics-row"),
 
         html.H3("By Competitor (Offline)", className="section-title"),
-
-        # Stacked counts bar (found + missing = offline total)
-        html.Div(
-            dcc.Graph(id="comp-volume-chart"),
-            className="card",
-        ),
+        html.Div(dcc.Graph(id="comp-volume-chart"), className="card"),
 
         html.Div(
             [
@@ -459,6 +451,7 @@ app.layout = html.Div(
             ],
             className="card",
         ),
+
         html.Div(
             [
                 html.Div(
@@ -480,14 +473,10 @@ app.layout = html.Div(
                         dash_table.DataTable(
                             id="missing-table",
                             data=[],
-                            columns=[
-                                {"name": "SKU", "id": "SKU"},
-                                {"name": "URL", "id": "URL"},
-                            ],
+                            columns=[{"name": "SKU", "id": "SKU"}, {"name": "URL", "id": "URL"}],
                             **COMMON_TABLE_PROPS,
                             page_size=12,
                             export_format="csv",
-
                         ),
                     ],
                     className="card",
@@ -495,6 +484,7 @@ app.layout = html.Div(
             ],
             className="two-column-row",
         ),
+
         html.H3("Top Missing SKUs (Global)", className="section-title"),
         html.Div(
             dash_table.DataTable(
@@ -505,6 +495,34 @@ app.layout = html.Div(
                 page_size=20,
             ),
             className="card",
+        ),
+
+        # --------- Invalid links section --------- #
+        html.H3("Invalid link SKUs", className="section-title"),
+        html.Div(
+            [
+                html.Div(id="invalid-rowcount-msg", className="upload-summary", style={"marginBottom": "8px"}),
+
+                dcc.Graph(id="invalid-links-chart"),
+
+                dcc.Dropdown(
+                    id="invalid-competitor-dropdown",
+                    options=[],
+                    placeholder="Select competitor (invalid links)",
+                    className="dropdown",
+                ),
+
+                dash_table.DataTable(
+                    id="invalid-sku-table",
+                    data=[],
+                    columns=[{"name": "SKU", "id": "SKU"}, {"name": "URL", "id": "URL"}],
+                    **COMMON_TABLE_PROPS,
+                    page_size=15,
+                    export_format="csv",
+                ),
+            ],
+            className="card",
+            style={"padding": "12px"},
         ),
     ],
     className="app-container",
@@ -545,19 +563,30 @@ def handle_uploads(off_content, look_content, off_name, look_name):
     Output("top-missing", "columns"),
     Output("distinct-cards", "children"),
     Output("upload-summary", "children"),
+    Output("offline-invalid-data", "data"),
+    Output("invalid-competitor-dropdown", "options"),
+    Output("invalid-competitor-dropdown", "value"),
+    Output("invalid-rowcount-msg", "children"),
     Input("offline-data", "data"),
     Input("looker-data", "data"),
+    Input("toggle-remove-invalid", "value"),
 )
-def update_views(off_data, look_data):
-    off_df = pd.DataFrame(off_data or [], columns=["Competitor", "SKU", "URL"])
+def update_views(off_data, look_data, toggle_value):
+    off_df = pd.DataFrame(off_data or [])
     look_df = pd.DataFrame(look_data or [], columns=["Competitor", "SKU"])
 
-    merged, comp_stats, global_stats, unmatched_offline = compute_metrics(off_df, look_df)
+    remove_invalid = bool(toggle_value and "on" in toggle_value)
 
-    # Overall metrics cards (includes competitor counts now)
+    # invalid links dataset for bottom section
+    invalid_df, row_count_msg = split_invalid_links(off_df)
+
+    # dataset used by ALL existing charts/tables
+    off_df_for_metrics = apply_remove_invalid_toggle(off_df, remove_invalid)
+
+    merged, comp_stats, global_stats, unmatched_offline = compute_metrics(off_df_for_metrics, look_df)
+
+    # Metrics cards + chart + competitor table
     cards = metric_cards(global_stats)
-
-    # Stacked counts bar (found + missing)
     comp_volume_fig = comp_stack_chart(comp_stats)
 
     comp_cols = table_columns(comp_stats) if not comp_stats.empty else []
@@ -567,6 +596,7 @@ def update_views(off_data, look_data):
     dropdown_options = [{"label": c, "value": c} for c in competitors]
     dropdown_value = competitors[0] if competitors else None
 
+    # Top missing global
     missing = merged[~merged["FoundInLooker"]]
     top_missing = (
         missing.groupby("SKU")
@@ -581,23 +611,20 @@ def update_views(off_data, look_data):
     top_cols = table_columns(top_missing) if not top_missing.empty else []
     top_data = top_missing.to_dict("records")
 
-    # Distinct SKUs summary (as cards)
+    # Distinct cards
     distinct_stats = pd.DataFrame(
         {
-            "metric": [
-                "Offline Distinct SKUs",
-                "Looker Distinct SKUs",
-            ],
+            "metric": ["Offline Distinct SKUs", "Looker Distinct SKUs"],
             "value": [
-                off_df["SKU"].nunique(),
-                look_df["SKU"].nunique(),
+                off_df_for_metrics["SKU"].nunique() if "SKU" in off_df_for_metrics.columns else 0,
+                look_df["SKU"].nunique() if "SKU" in look_df.columns else 0,
             ],
         }
     )
     distinct_cards = metric_cards(distinct_stats)
 
-    # Upload summary: rows + offline-only competitors
-    offline_rows = len(off_df)
+    # Upload summary
+    offline_rows = len(off_df_for_metrics)
     looker_rows = len(look_df)
     unmatched_names = sorted(unmatched_offline["Competitor"].unique())
     if unmatched_names:
@@ -606,14 +633,25 @@ def update_views(off_data, look_data):
         if extra > 0:
             preview += f", +{extra} more"
         summary = (
-            f"Offline rows: {offline_rows} | Looker rows: {looker_rows} | "
+            f"Offline rows (after filter): {offline_rows} | Looker rows: {looker_rows} | "
             f"Offline-only competitors ({len(unmatched_names)}): {preview}"
         )
     else:
         summary = (
-            f"Offline rows: {offline_rows} | Looker rows: {looker_rows} | "
+            f"Offline rows (after filter): {offline_rows} | Looker rows: {looker_rows} | "
             "All offline competitors have a match in Looker."
         )
+
+    # Invalid competitor dropdown defaults
+    if row_count_msg:
+        invalid_opts = []
+        invalid_val = None
+        invalid_msg = row_count_msg
+    else:
+        inv_comps = sorted(invalid_df["Competitor"].dropna().unique())
+        invalid_opts = [{"label": c, "value": c} for c in inv_comps]
+        invalid_val = inv_comps[0] if inv_comps else None
+        invalid_msg = f"{len(invalid_df)} invalid rows (row_count = 1)."
 
     return (
         cards,
@@ -626,6 +664,10 @@ def update_views(off_data, look_data):
         top_cols,
         distinct_cards,
         summary,
+        invalid_df.to_dict("records"),
+        invalid_opts,
+        invalid_val,
+        invalid_msg,
     )
 
 
@@ -635,22 +677,24 @@ def update_views(off_data, look_data):
     Input("competitor-dropdown", "value"),
     State("offline-data", "data"),
     State("looker-data", "data"),
+    State("toggle-remove-invalid", "value"),
 )
-def update_drilldown(selected_comp, off_data, look_data):
+def update_drilldown(selected_comp, off_data, look_data, toggle_value):
     if not selected_comp:
         return [], []
 
-    off_df = pd.DataFrame(off_data or [], columns=["Competitor", "SKU", "URL"])
+    off_df = pd.DataFrame(off_data or [])
     look_df = pd.DataFrame(look_data or [], columns=["Competitor", "SKU"])
 
-    merged, _, _, _ = compute_metrics(off_df, look_df)
+    remove_invalid = bool(toggle_value and "on" in toggle_value)
+    off_df_for_metrics = apply_remove_invalid_toggle(off_df, remove_invalid)
+
+    merged, _, _, _ = compute_metrics(off_df_for_metrics, look_df)
     subset = merged[merged["Competitor"] == selected_comp].copy()
 
-    # Found SKUs (just SKU)
     found = subset[subset["FoundInLooker"]]["SKU"].drop_duplicates().sort_values()
     found_data = [{"SKU": sku} for sku in found]
 
-    # Missing SKUs: SKU + URL (if available)
     if "URL" in subset.columns:
         missing_df = (
             subset[~subset["FoundInLooker"]][["SKU", "URL"]]
@@ -663,6 +707,30 @@ def update_drilldown(selected_comp, off_data, look_data):
         missing_data = [{"SKU": sku} for sku in missing]
 
     return found_data, missing_data
+
+
+@callback(
+    Output("invalid-sku-table", "data"),
+    Output("invalid-links-chart", "figure"),
+    Input("invalid-competitor-dropdown", "value"),
+    State("offline-invalid-data", "data"),
+)
+def update_invalid_section(selected_comp, invalid_data):
+    inv_df = pd.DataFrame(invalid_data or [], columns=["Competitor", "SKU", "URL"])
+
+    # Chart always shows full distribution (but highlights selection)
+    fig = invalid_links_bar_chart(inv_df, selected_comp)
+
+    # Table filtered by selected competitor
+    if inv_df.empty or not selected_comp:
+        return [], fig
+
+    subset = inv_df[inv_df["Competitor"] == selected_comp].copy()
+    if "URL" not in subset.columns:
+        subset["URL"] = ""
+
+    subset = subset[["SKU", "URL"]].drop_duplicates().sort_values("SKU")
+    return subset.to_dict("records"), fig
 
 
 server = app.server
