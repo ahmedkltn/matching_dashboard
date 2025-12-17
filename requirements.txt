@@ -5,3 +5,5 @@ plotly
 altair
 streamlit
 gunicorn
+snowflake-connector-python
+dotenv

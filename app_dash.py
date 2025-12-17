@@ -1,12 +1,23 @@
 import base64
 import io
 import re
+import time
 from typing import Optional, Tuple
 
 import pandas as pd
 import plotly.express as px
-from dash import Dash, Input, Output, State, callback, dcc, html
-from dash import dash_table
+from dash import Dash, Input, Output, State, callback, dcc, html, dash_table, ctx, no_update
+
+# Uses your existing file snowflake_client.py
+from snowflake_client import resultScrapingData
+
+
+# =========================
+# In-memory cache (local dev)
+# =========================
+# OFFLINE_CACHE[country] = {"ts": float_epoch, "data": list[dict]}
+OFFLINE_CACHE: dict[str, dict] = {}
+CACHE_TTL_SECONDS = 15 * 60  # 15 minutes
 
 
 # --------- Helpers for reading & cleaning data --------- #
@@ -45,17 +56,20 @@ def parse_contents(contents: Optional[str]) -> pd.DataFrame:
 def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     """
     Keeps extra columns if present (e.g. URL, row_count).
+    Normalizes column names to expected ones.
     """
-    if df.empty:
+    if df is None or df.empty:
         return pd.DataFrame(columns=["Competitor", "SKU"])
 
     df = df.rename(columns={c: c.strip().lower() for c in df.columns})
+
     df = df.rename(
         columns={
             "competitor": "Competitor",
             "sku": "SKU",
             "url": "URL",
-            # row_count remains as "row_count" if present
+            "row_count": "row_count",
+            "country": "Country",
         }
     )
 
@@ -66,6 +80,7 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     df["Competitor"] = df["Competitor"].astype(str).str.strip()
     df["SKU"] = df["SKU"].astype(str).str.strip()
 
+    # Keep duplicates handling consistent
     df = df.dropna(subset=["Competitor", "SKU"]).drop_duplicates(subset=["Competitor", "SKU"])
     return df
 
@@ -75,6 +90,9 @@ def split_invalid_links(off_df: pd.DataFrame) -> tuple[pd.DataFrame, str | None]
     Invalid links are offline rows where row_count == 1.
     Returns (invalid_df, msg).
     """
+    if off_df is None or off_df.empty:
+        return pd.DataFrame(columns=["Competitor", "SKU", "URL"]), None
+
     if "row_count" not in off_df.columns:
         return pd.DataFrame(columns=["Competitor", "SKU", "URL"]), "No row_count column provided"
 
@@ -92,6 +110,9 @@ def apply_remove_invalid_toggle(off_df: pd.DataFrame, remove_invalid: bool) -> p
     If remove_invalid is True and row_count exists: keep only row_count > 1
     Otherwise: return full off_df.
     """
+    if off_df is None or off_df.empty:
+        return off_df
+
     if not remove_invalid:
         return off_df
 
@@ -107,7 +128,7 @@ def apply_remove_invalid_toggle(off_df: pd.DataFrame, remove_invalid: bool) -> p
 _COUNTRY_TOKENS = {
     "de", "fr", "es", "it", "nl", "uk", "gb", "be", "ch",
     "at", "ie", "pl", "pt", "cz", "dk", "se", "no", "fi",
-    "us", "ca"
+    "us", "ca", "au"
 }
 
 
@@ -271,7 +292,6 @@ def invalid_links_bar_chart(invalid_df: pd.DataFrame, selected_comp: str | None)
         .sort_values("invalid_count", ascending=False)
     )
 
-    # Highlight selection by changing opacity
     if selected_comp:
         counts["is_selected"] = counts["Competitor"].eq(selected_comp)
         counts["opacity"] = counts["is_selected"].map({True: 1.0, False: 0.25})
@@ -283,10 +303,7 @@ def invalid_links_bar_chart(invalid_df: pd.DataFrame, selected_comp: str | None)
         x="Competitor",
         y="invalid_count",
         labels={"invalid_count": "Invalid links (row_count = 1)"},
-        hover_data={"opacity": False},
     )
-
-    # Apply per-bar opacity
     fig.update_traces(marker={"opacity": counts["opacity"].tolist()})
 
     fig.update_layout(
@@ -342,7 +359,11 @@ COMMON_TABLE_PROPS = dict(
 )
 
 
-# --------- Dash app --------- #
+# =========================
+# Dash app
+# =========================
+
+COUNTRIES = ["GB", "ES", "US", "DE", "IT", "AU", "CA", "FR"]
 
 app = Dash(__name__)
 
@@ -350,51 +371,88 @@ app.layout = html.Div(
     [
         dcc.Store(id="offline-data"),
         dcc.Store(id="looker-data"),
-        dcc.Store(id="offline-invalid-data"),  # invalid rows (row_count == 1) only
+        dcc.Store(id="offline-invalid-data"),
 
         html.H1("Match Coverage Dashboard", className="app-title"),
-        html.P(
-            "Compare offline matched SKUs vs Looker scraped SKUs to quantify coverage and losses. "
-            "Competitor names are matched flexibly (e.g. 'maxilia DE' vs 'maxilia').",
-            className="app-subtitle",
-        ),
 
+        html.H3("Offline Source", className="section-title"),
         html.Div(
             [
-                html.Div(
-                    [
-                        html.H4("Offline DB CSV (Competitor, SKU, URL)", className="section-title"),
-                        dcc.Upload(
-                            id="upload-offline",
-                            children=html.Div(["Drag and Drop or ", html.B("Select File")]),
-                            className="upload-box",
-                        ),
+                dcc.RadioItems(
+                    id="offline-source",
+                    options=[
+                        {"label": "Upload CSV", "value": "upload"},
+                        {"label": "Fetch from Snowflake", "value": "snowflake"},
                     ],
-                    className="uploader-card",
-                ),
-                html.Div(
-                    [
-                        html.H4("Looker CSV (Competitor, SKU)", className="section-title"),
-                        dcc.Upload(
-                            id="upload-looker",
-                            children=html.Div(["Drag and Drop or ", html.B("Select File")]),
-                            className="upload-box",
-                        ),
-                    ],
-                    className="uploader-card",
+                    value="upload",
+                    inline=True,
                 ),
             ],
-            className="uploader-row",
+            className="card",
+            style={"padding": "10px 12px"},
         ),
 
+        # Upload offline container
         html.Div(
             [
-                html.Div("Sample files: data/sample_offline.csv, data/sample_looker.csv", className="sample-hint"),
-                html.Div(id="upload-status", className="upload-status"),
+                html.H4("Offline DB CSV (Competitor, SKU, URL, optional row_count)", className="section-title"),
+                dcc.Upload(
+                    id="upload-offline",
+                    children=html.Div(["Drag and Drop or ", html.B("Select File")]),
+                    className="upload-box",
+                ),
             ],
-            style={"marginTop": "8px"},
+            id="offline-upload-container",
+            className="uploader-card",
+            style={"marginTop": "10px"},
         ),
 
+        # Snowflake fetch container (with loading spinner)
+        html.Div(
+            [
+                html.H4("Fetch Offline from Snowflake", className="section-title"),
+                dcc.Dropdown(
+                    id="country-dropdown",
+                    options=[{"label": c, "value": c} for c in COUNTRIES],
+                    value="DE",
+                    clearable=False,
+                ),
+                dcc.Loading(
+                    type="default",
+                    children=html.Div(
+                        [
+                            html.Button("Fetch", id="btn-fetch", n_clicks=0, style={"marginTop": "8px"}),
+                            html.Div(
+                                id="snowflake-fetch-status",
+                                style={"marginTop": "8px", "fontSize": "13px"},
+                            ),
+                        ]
+                    ),
+                ),
+                html.Div(
+                    "Note: externalbrowser auth opens your browser for Auth0 SSO (first time or when session expires).",
+                    style={"marginTop": "6px", "fontSize": "12px", "opacity": 0.8},
+                ),
+            ],
+            id="snowflake-fetch-container",
+            className="card",
+            style={"padding": "12px", "marginTop": "10px", "display": "none"},
+        ),
+
+        html.H3("Looker Input", className="section-title"),
+        html.Div(
+            [
+                html.H4("Looker CSV (Competitor, SKU)", className="section-title"),
+                dcc.Upload(
+                    id="upload-looker",
+                    children=html.Div(["Drag and Drop or ", html.B("Select File")]),
+                    className="upload-box",
+                ),
+            ],
+            className="uploader-card",
+        ),
+
+        html.Div(id="upload-status", className="upload-status", style={"marginTop": "8px"}),
         html.Div(id="upload-summary", className="upload-summary", style={"marginTop": "4px"}),
 
         # Toggle (default ON)
@@ -405,7 +463,7 @@ app.layout = html.Div(
                     [
                         dcc.Checklist(
                             id="toggle-remove-invalid",
-                            options=[{"label": "Remove invalid links", "value": "on"}],
+                            options=[{"label": "Remove invalid links (row_count > 1)", "value": "on"}],
                             value=["on"],
                             labelStyle={"display": "inline-block", "marginRight": "12px"},
                         ),
@@ -424,15 +482,21 @@ app.layout = html.Div(
         html.Div(id="distinct-cards", className="metrics-row"),
 
         html.H3("By Competitor (Offline)", className="section-title"),
-        html.Div(dcc.Graph(id="comp-volume-chart"), className="card"),
+        html.Div(
+            dcc.Loading(type="default", children=dcc.Graph(id="comp-volume-chart")),
+            className="card",
+        ),
 
         html.Div(
             [
-                dash_table.DataTable(
-                    id="comp-table",
-                    data=[],
-                    columns=[],
-                    **COMMON_TABLE_PROPS,
+                dcc.Loading(
+                    type="default",
+                    children=dash_table.DataTable(
+                        id="comp-table",
+                        data=[],
+                        columns=[],
+                        **COMMON_TABLE_PROPS,
+                    ),
                 )
             ],
             className="card",
@@ -446,7 +510,6 @@ app.layout = html.Div(
                     id="competitor-dropdown",
                     options=[],
                     placeholder="Select competitor",
-                    className="dropdown",
                 )
             ],
             className="card",
@@ -457,12 +520,15 @@ app.layout = html.Div(
                 html.Div(
                     [
                         html.H4("SKUs Found in Looker", className="subsection-title"),
-                        dash_table.DataTable(
-                            id="found-table",
-                            data=[],
-                            columns=[{"name": "SKU", "id": "SKU"}],
-                            **COMMON_TABLE_PROPS,
-                            page_size=12,
+                        dcc.Loading(
+                            type="default",
+                            children=dash_table.DataTable(
+                                id="found-table",
+                                data=[],
+                                columns=[{"name": "SKU", "id": "SKU"}],
+                                **COMMON_TABLE_PROPS,
+                                page_size=12,
+                            ),
                         ),
                     ],
                     className="card",
@@ -470,13 +536,16 @@ app.layout = html.Div(
                 html.Div(
                     [
                         html.H4("SKUs Missing in Looker", className="subsection-title"),
-                        dash_table.DataTable(
-                            id="missing-table",
-                            data=[],
-                            columns=[{"name": "SKU", "id": "SKU"}, {"name": "URL", "id": "URL"}],
-                            **COMMON_TABLE_PROPS,
-                            page_size=12,
-                            export_format="csv",
+                        dcc.Loading(
+                            type="default",
+                            children=dash_table.DataTable(
+                                id="missing-table",
+                                data=[],
+                                columns=[{"name": "SKU", "id": "SKU"}, {"name": "URL", "id": "URL"}],
+                                **COMMON_TABLE_PROPS,
+                                page_size=12,
+                                export_format="csv",
+                            ),
                         ),
                     ],
                     className="card",
@@ -487,12 +556,15 @@ app.layout = html.Div(
 
         html.H3("Top Missing SKUs (Global)", className="section-title"),
         html.Div(
-            dash_table.DataTable(
-                id="top-missing",
-                data=[],
-                columns=[],
-                **COMMON_TABLE_PROPS,
-                page_size=20,
+            dcc.Loading(
+                type="default",
+                children=dash_table.DataTable(
+                    id="top-missing",
+                    data=[],
+                    columns=[],
+                    **COMMON_TABLE_PROPS,
+                    page_size=20,
+                ),
             ),
             className="card",
         ),
@@ -503,22 +575,24 @@ app.layout = html.Div(
             [
                 html.Div(id="invalid-rowcount-msg", className="upload-summary", style={"marginBottom": "8px"}),
 
-                dcc.Graph(id="invalid-links-chart"),
+                dcc.Loading(type="default", children=dcc.Graph(id="invalid-links-chart")),
 
                 dcc.Dropdown(
                     id="invalid-competitor-dropdown",
                     options=[],
                     placeholder="Select competitor (invalid links)",
-                    className="dropdown",
                 ),
 
-                dash_table.DataTable(
-                    id="invalid-sku-table",
-                    data=[],
-                    columns=[{"name": "SKU", "id": "SKU"}, {"name": "URL", "id": "URL"}],
-                    **COMMON_TABLE_PROPS,
-                    page_size=15,
-                    export_format="csv",
+                dcc.Loading(
+                    type="default",
+                    children=dash_table.DataTable(
+                        id="invalid-sku-table",
+                        data=[],
+                        columns=[{"name": "SKU", "id": "SKU"}, {"name": "URL", "id": "URL"}],
+                        **COMMON_TABLE_PROPS,
+                        page_size=15,
+                        export_format="csv",
+                    ),
                 ),
             ],
             className="card",
@@ -529,27 +603,97 @@ app.layout = html.Div(
 )
 
 
+# Show/hide the correct offline source UI
 @callback(
-    Output("offline-data", "data"),
+    Output("offline-upload-container", "style"),
+    Output("snowflake-fetch-container", "style"),
+    Input("offline-source", "value"),
+)
+def toggle_offline_source_ui(source):
+    if source == "snowflake":
+        return {"display": "none"}, {"padding": "12px", "marginTop": "10px", "display": "block"}
+    return {"marginTop": "10px", "display": "block"}, {"display": "none"}
+
+
+# Load Looker data from upload (always)
+@callback(
     Output("looker-data", "data"),
-    Output("upload-status", "children"),
-    Input("upload-offline", "contents"),
     Input("upload-looker", "contents"),
-    State("upload-offline", "filename"),
-    State("upload-looker", "filename"),
     prevent_initial_call=False,
 )
-def handle_uploads(off_content, look_content, off_name, look_name):
-    off_df = clean_df(parse_contents(off_content))
-    look_df = clean_df(parse_contents(look_content))
+def load_looker(contents):
+    df_c = clean_df(parse_contents(contents))
+    return df_c.to_dict("records")
 
-    status_parts = []
-    if off_name:
-        status_parts.append(f"Offline: {off_name} ({len(off_df)} rows)")
-    if look_name:
-        status_parts.append(f"Looker: {look_name} ({len(look_df)} rows)")
-    status = " | ".join(status_parts) if status_parts else "Waiting for uploads..."
-    return off_df.to_dict("records"), look_df.to_dict("records"), status
+
+def _cache_get(country: str) -> list[dict] | None:
+    entry = OFFLINE_CACHE.get(country)
+    if not entry:
+        return None
+    if (time.time() - entry["ts"]) > CACHE_TTL_SECONDS:
+        OFFLINE_CACHE.pop(country, None)
+        return None
+    return entry["data"]
+
+
+def _cache_set(country: str, data: list[dict]) -> None:
+    OFFLINE_CACHE[country] = {"ts": time.time(), "data": data}
+
+
+# Load Offline data from either Upload OR Snowflake (with cache + loading status)
+@callback(
+    Output("offline-data", "data"),
+    Output("upload-status", "children"),
+    Output("snowflake-fetch-status", "children"),
+    Input("upload-offline", "contents"),
+    Input("btn-fetch", "n_clicks"),
+    Input("offline-source", "value"),
+    State("country-dropdown", "value"),
+    State("upload-offline", "filename"),
+    prevent_initial_call=False,
+)
+def load_offline(off_contents, n_fetch, source, country, off_filename):
+    trig = ctx.triggered_id
+
+    # Switching sources: keep existing offline-data, just instruct user
+    if trig == "offline-source":
+        if source == "snowflake":
+            return no_update, "Offline source changed to Snowflake.", "Select a country and click Fetch."
+        return no_update, "Offline source changed to Upload.", ""
+
+    # Upload path
+    if source == "upload":
+        if off_contents is None:
+            return no_update, "Waiting for offline upload...", ""
+        df_c = clean_df(parse_contents(off_contents))
+        name = off_filename or "offline.csv"
+        return df_c.to_dict("records"), f"Offline loaded from upload: {name} ({len(df_c)} rows)", ""
+
+    # Snowflake path: only fetch on button click
+    if source == "snowflake":
+        if trig != "btn-fetch":
+            return no_update, "Snowflake mode enabled.", "Select a country and click Fetch."
+
+        country = (country or "").strip().upper()
+        if country not in COUNTRIES:
+            return no_update, "Snowflake mode enabled.", f"Invalid country '{country}'."
+
+        # Cache hit
+        cached = _cache_get(country)
+        if cached is not None:
+            return cached, f"Offline loaded from cache for {country} ({len(cached)} rows)", f"Cache hit (TTL {CACHE_TTL_SECONDS//60}m)."
+
+        # Cache miss → call your function
+        try:
+            df_c = resultScrapingData(country)
+            df_c = clean_df(df_c)
+            records = df_c.to_dict("records")
+            _cache_set(country, records)
+            return records, f"Offline loaded from Snowflake for {country} ({len(records)} rows)", "Fetched from Snowflake and cached."
+        except Exception as e:
+            return no_update, "Snowflake fetch failed.", f"{type(e).__name__}: {e}"
+
+    return no_update, "Waiting...", ""
 
 
 @callback(
@@ -575,17 +719,32 @@ def update_views(off_data, look_data, toggle_value):
     off_df = pd.DataFrame(off_data or [])
     look_df = pd.DataFrame(look_data or [], columns=["Competitor", "SKU"])
 
+    if off_df.empty or look_df.empty:
+        empty_stats = pd.DataFrame({"metric": ["Offline rows", "Looker rows"], "value": [len(off_df), len(look_df)]})
+        return (
+            metric_cards(empty_stats),
+            {},
+            [],
+            [],
+            [],
+            None,
+            [],
+            [],
+            metric_cards(empty_stats),
+            "Upload/fetch Offline and upload Looker to compute metrics.",
+            [],
+            [],
+            None,
+            "",
+        )
+
     remove_invalid = bool(toggle_value and "on" in toggle_value)
 
-    # invalid links dataset for bottom section
     invalid_df, row_count_msg = split_invalid_links(off_df)
-
-    # dataset used by ALL existing charts/tables
     off_df_for_metrics = apply_remove_invalid_toggle(off_df, remove_invalid)
 
     merged, comp_stats, global_stats, unmatched_offline = compute_metrics(off_df_for_metrics, look_df)
 
-    # Metrics cards + chart + competitor table
     cards = metric_cards(global_stats)
     comp_volume_fig = comp_stack_chart(comp_stats)
 
@@ -596,7 +755,6 @@ def update_views(off_data, look_data, toggle_value):
     dropdown_options = [{"label": c, "value": c} for c in competitors]
     dropdown_value = competitors[0] if competitors else None
 
-    # Top missing global
     missing = merged[~merged["FoundInLooker"]]
     top_missing = (
         missing.groupby("SKU")
@@ -611,7 +769,6 @@ def update_views(off_data, look_data, toggle_value):
     top_cols = table_columns(top_missing) if not top_missing.empty else []
     top_data = top_missing.to_dict("records")
 
-    # Distinct cards
     distinct_stats = pd.DataFrame(
         {
             "metric": ["Offline Distinct SKUs", "Looker Distinct SKUs"],
@@ -623,7 +780,6 @@ def update_views(off_data, look_data, toggle_value):
     )
     distinct_cards = metric_cards(distinct_stats)
 
-    # Upload summary
     offline_rows = len(off_df_for_metrics)
     looker_rows = len(look_df)
     unmatched_names = sorted(unmatched_offline["Competitor"].unique())
@@ -642,7 +798,6 @@ def update_views(off_data, look_data, toggle_value):
             "All offline competitors have a match in Looker."
         )
 
-    # Invalid competitor dropdown defaults
     if row_count_msg:
         invalid_opts = []
         invalid_val = None
@@ -686,6 +841,9 @@ def update_drilldown(selected_comp, off_data, look_data, toggle_value):
     off_df = pd.DataFrame(off_data or [])
     look_df = pd.DataFrame(look_data or [], columns=["Competitor", "SKU"])
 
+    if off_df.empty or look_df.empty:
+        return [], []
+
     remove_invalid = bool(toggle_value and "on" in toggle_value)
     off_df_for_metrics = apply_remove_invalid_toggle(off_df, remove_invalid)
 
@@ -718,10 +876,8 @@ def update_drilldown(selected_comp, off_data, look_data, toggle_value):
 def update_invalid_section(selected_comp, invalid_data):
     inv_df = pd.DataFrame(invalid_data or [], columns=["Competitor", "SKU", "URL"])
 
-    # Chart always shows full distribution (but highlights selection)
     fig = invalid_links_bar_chart(inv_df, selected_comp)
 
-    # Table filtered by selected competitor
     if inv_df.empty or not selected_comp:
         return [], fig
 
