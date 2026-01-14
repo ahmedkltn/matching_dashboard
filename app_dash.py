@@ -55,7 +55,7 @@ def parse_contents(contents: Optional[str]) -> pd.DataFrame:
 
 def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Keeps extra columns if present (e.g. URL, row_count).
+    Keeps extra columns if present (e.g. URL, row_count, Country).
     Normalizes column names to expected ones.
     """
     if df is None or df.empty:
@@ -121,6 +121,24 @@ def apply_remove_invalid_toggle(off_df: pd.DataFrame, remove_invalid: bool) -> p
 
     rc = pd.to_numeric(off_df["row_count"], errors="coerce")
     return off_df[rc > 1].copy()
+
+
+def derive_selected_country_from_df(df: pd.DataFrame) -> str:
+    """
+    Best effort to infer a country code from uploaded/offline df.
+    """
+    if df is None or df.empty:
+        return ""
+    if "Country" not in df.columns:
+        return ""
+    s = df["Country"].dropna().astype(str).str.strip()
+    if s.empty:
+        return ""
+    # Most frequent value is usually best if mixed; fallback to first
+    try:
+        return s.value_counts().idxmax()
+    except Exception:
+        return s.iloc[0]
 
 
 # --------- Competitor name normalization / alignment --------- #
@@ -372,6 +390,7 @@ app.layout = html.Div(
         dcc.Store(id="offline-data"),
         dcc.Store(id="looker-data"),
         dcc.Store(id="offline-invalid-data"),
+        dcc.Store(id="selected-country"),  # NEW: stores the currently selected country (Snowflake dropdown or inferred from upload)
 
         html.H1("Match Coverage Dashboard", className="app-title"),
 
@@ -594,6 +613,20 @@ app.layout = html.Div(
                         export_format="csv",
                     ),
                 ),
+
+                html.H4("All invalid links (all competitors)", className="subsection-title", style={"marginTop": "14px"}),
+
+                dcc.Loading(
+                    type="default",
+                    children=dash_table.DataTable(
+                        id="invalid-all-table",
+                        data=[],
+                        columns=[],
+                        **COMMON_TABLE_PROPS,
+                        page_size=20,
+                        export_format="csv",
+                    ),
+                ),
             ],
             className="card",
             style={"padding": "12px"},
@@ -645,6 +678,7 @@ def _cache_set(country: str, data: list[dict]) -> None:
     Output("offline-data", "data"),
     Output("upload-status", "children"),
     Output("snowflake-fetch-status", "children"),
+    Output("selected-country", "data"),  # NEW
     Input("upload-offline", "contents"),
     Input("btn-fetch", "n_clicks"),
     Input("offline-source", "value"),
@@ -658,30 +692,36 @@ def load_offline(off_contents, n_fetch, source, country, off_filename):
     # Switching sources: keep existing offline-data, just instruct user
     if trig == "offline-source":
         if source == "snowflake":
-            return no_update, "Offline source changed to Snowflake.", "Select a country and click Fetch."
-        return no_update, "Offline source changed to Upload.", ""
+            return no_update, "Offline source changed to Snowflake.", "Select a country and click Fetch.", no_update
+        return no_update, "Offline source changed to Upload.", "", no_update
 
     # Upload path
     if source == "upload":
         if off_contents is None:
-            return no_update, "Waiting for offline upload...", ""
+            return no_update, "Waiting for offline upload...", "", no_update
         df_c = clean_df(parse_contents(off_contents))
         name = off_filename or "offline.csv"
-        return df_c.to_dict("records"), f"Offline loaded from upload: {name} ({len(df_c)} rows)", ""
+        selected_country = derive_selected_country_from_df(df_c)
+        return df_c.to_dict("records"), f"Offline loaded from upload: {name} ({len(df_c)} rows)", "", selected_country
 
     # Snowflake path: only fetch on button click
     if source == "snowflake":
         if trig != "btn-fetch":
-            return no_update, "Snowflake mode enabled.", "Select a country and click Fetch."
+            return no_update, "Snowflake mode enabled.", "Select a country and click Fetch.", no_update
 
         country = (country or "").strip().upper()
         if country not in COUNTRIES:
-            return no_update, "Snowflake mode enabled.", f"Invalid country '{country}'."
+            return no_update, "Snowflake mode enabled.", f"Invalid country '{country}'.", no_update
 
         # Cache hit
         cached = _cache_get(country)
         if cached is not None:
-            return cached, f"Offline loaded from cache for {country} ({len(cached)} rows)", f"Cache hit (TTL {CACHE_TTL_SECONDS//60}m)."
+            return (
+                cached,
+                f"Offline loaded from cache for {country} ({len(cached)} rows)",
+                f"Cache hit (TTL {CACHE_TTL_SECONDS//60}m).",
+                country,  # selected country
+            )
 
         # Cache miss → call your function
         try:
@@ -689,11 +729,16 @@ def load_offline(off_contents, n_fetch, source, country, off_filename):
             df_c = clean_df(df_c)
             records = df_c.to_dict("records")
             _cache_set(country, records)
-            return records, f"Offline loaded from Snowflake for {country} ({len(records)} rows)", "Fetched from Snowflake and cached."
+            return (
+                records,
+                f"Offline loaded from Snowflake for {country} ({len(records)} rows)",
+                "Fetched from Snowflake and cached.",
+                country,  # selected country
+            )
         except Exception as e:
-            return no_update, "Snowflake fetch failed.", f"{type(e).__name__}: {e}"
+            return no_update, "Snowflake fetch failed.", f"{type(e).__name__}: {e}", no_update
 
-    return no_update, "Waiting...", ""
+    return no_update, "Waiting...", "", no_update
 
 
 @callback(
@@ -711,11 +756,14 @@ def load_offline(off_contents, n_fetch, source, country, off_filename):
     Output("invalid-competitor-dropdown", "options"),
     Output("invalid-competitor-dropdown", "value"),
     Output("invalid-rowcount-msg", "children"),
+    Output("invalid-all-table", "data"),     # NEW
+    Output("invalid-all-table", "columns"),  # NEW
     Input("offline-data", "data"),
     Input("looker-data", "data"),
     Input("toggle-remove-invalid", "value"),
+    Input("selected-country", "data"),       # NEW
 )
-def update_views(off_data, look_data, toggle_value):
+def update_views(off_data, look_data, toggle_value, selected_country):
     off_df = pd.DataFrame(off_data or [])
     look_df = pd.DataFrame(look_data or [], columns=["Competitor", "SKU"])
 
@@ -736,6 +784,8 @@ def update_views(off_data, look_data, toggle_value):
             [],
             None,
             "",
+            [],
+            [],
         )
 
     remove_invalid = bool(toggle_value and "on" in toggle_value)
@@ -798,6 +848,7 @@ def update_views(off_data, look_data, toggle_value):
             "All offline competitors have a match in Looker."
         )
 
+    # Invalid (row_count=1) dropdown/table + message
     if row_count_msg:
         invalid_opts = []
         invalid_val = None
@@ -807,6 +858,29 @@ def update_views(off_data, look_data, toggle_value):
         invalid_opts = [{"label": c, "value": c} for c in inv_comps]
         invalid_val = inv_comps[0] if inv_comps else None
         invalid_msg = f"{len(invalid_df)} invalid rows (row_count = 1)."
+
+    # NEW: downloadable "all invalid links" table with Competitor + Country (selected)
+    if row_count_msg:
+        invalid_all_data = []
+        invalid_all_cols = []
+    else:
+        invalid_all_df = invalid_df.copy()
+
+        if "URL" not in invalid_all_df.columns:
+            invalid_all_df["URL"] = ""
+
+        country_value = (selected_country or "").strip()
+        invalid_all_df["Country"] = country_value
+
+        # Ensure Competitor col exists (it should)
+        if "Competitor" not in invalid_all_df.columns:
+            invalid_all_df["Competitor"] = ""
+
+        invalid_all_df = invalid_all_df[["Country", "Competitor", "SKU", "URL"]].drop_duplicates()
+        invalid_all_df = invalid_all_df.sort_values(["Competitor", "SKU"], ascending=[True, True])
+
+        invalid_all_cols = table_columns(invalid_all_df)
+        invalid_all_data = invalid_all_df.to_dict("records")
 
     return (
         cards,
@@ -823,6 +897,8 @@ def update_views(off_data, look_data, toggle_value):
         invalid_opts,
         invalid_val,
         invalid_msg,
+        invalid_all_data,
+        invalid_all_cols,
     )
 
 

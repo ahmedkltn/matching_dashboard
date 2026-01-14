@@ -36,7 +36,17 @@ def query_df(sql: str, params: tuple | None = None) -> pd.DataFrame:
 
 
 RESULT_SCRAPING_DATA_SQL = """
-WITH NP_Status AS (
+WITH country_cfg AS (
+    SELECT
+        UPPER(%s) AS country,
+        CASE
+            WHEN UPPER(%s) IN ('ES', 'FR', 'DE', 'IT', 'UK', 'GB') THEN 'NPL'
+            WHEN UPPER(%s) IN ('CA', 'US') THEN 'NADM'
+            ELSE 'AU/NZ'
+        END AS channel
+),
+
+NP_Status AS (
     SELECT
         COALESCE(np_sku, product_id) AS np_sku,
         COALESCE(status, v2_status)  AS status
@@ -54,11 +64,12 @@ WITH NP_Status AS (
                     WHEN npproductcode LIKE 'VDS%%' THEN itemstatus
                     ELSE productfamilysummarystatus
                 END AS status,
-                channel
+                t1.channel
             FROM NATPEN_LAKE_PROD.PIM.PIM_PRODUCTCHANNELS t1
             JOIN NATPEN_LAKE_PROD.PIM.PIM_PRODUCTS t2
                 ON t1.PRODUCTID = t2.PRODUCTID
-            WHERE channel IN ('NPL', 'NADM', 'AU/NZ')
+            JOIN country_cfg cfg
+                ON t1.channel = cfg.channel
         ) inn
         FULL JOIN (
             SELECT DISTINCT
@@ -149,7 +160,13 @@ def resultScrapingData(country: str) -> pd.DataFrame:
     if not country:
         raise ValueError("country must be a non-empty string like 'DE'")
 
-    params = (country, country, country)
+    # Params order matches %s occurrences:
+    # country_cfg: UPPER(%s), CASE UPPER(%s), CASE UPPER(%s)
+    # ranked_scrapes country: %s
+    # count_sku country: %s
+    # final WHERE country: %s
+    params = (country, country, country, country, country, country)
+
     df_c = query_df(RESULT_SCRAPING_DATA_SQL, params=params)
 
     rename_map = {
