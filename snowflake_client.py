@@ -58,11 +58,11 @@ NP_Status AS (
             v2.v2_status
         FROM (
             SELECT DISTINCT
-                npproductcode AS np_sku,
+                t2.npproductcode AS np_sku,
                 CASE
-                    WHEN npproductcode LIKE 'VEN%%' THEN itemstatus
-                    WHEN npproductcode LIKE 'VDS%%' THEN itemstatus
-                    ELSE productfamilysummarystatus
+                    WHEN t2.npproductcode LIKE 'VEN%%' THEN t1.itemstatus
+                    WHEN t2.npproductcode LIKE 'VDS%%' THEN t1.itemstatus
+                    ELSE t1.productfamilysummarystatus
                 END AS status,
                 t1.channel
             FROM NATPEN_LAKE_PROD.PIM.PIM_PRODUCTCHANNELS t1
@@ -83,26 +83,44 @@ NP_Status AS (
     )
 ),
 
-ranked_scrapes AS (
-    SELECT DISTINCT
+/* -------- Weekly snapshots aligned to Saturday -------- */
+
+weekly_scrapes AS (
+    SELECT
+        d.COUNTRY,
+        d.COMPETITOR,
+
+        /* Saturday of that week (to match Looker "Scraped Week Week") */
+        DATEADD(day, 5, DATE_TRUNC('WEEK', d.SCRAPED_DATE)) AS scrape_week_sat,
+
+        /* pick the latest scrape timestamp within that (Saturday-aligned) week bucket */
+        MAX(d.SCRAPED_DATE) AS week_scraped_date
+    FROM MCP.MARKETPLACE.COMPETITOR_MAPPED_DATA d
+    WHERE d.COUNTRY = %s
+    GROUP BY 1, 2, 3
+),
+
+/* Rank weekly snapshots (by scrape timestamp) per competitor */
+ranked_weeks AS (
+    SELECT
         COUNTRY,
         COMPETITOR,
-        SCRAPED_DATE,
+        scrape_week_sat,
+        week_scraped_date,
         DENSE_RANK() OVER (
             PARTITION BY COUNTRY, COMPETITOR
-            ORDER BY SCRAPED_DATE DESC
-        ) AS scrape_rank
-    FROM MCP.MARKETPLACE.COMPETITOR_MAPPED_DATA
-    WHERE COUNTRY = %s
+            ORDER BY week_scraped_date DESC
+        ) AS week_rank
+    FROM weekly_scrapes
 ),
 
 dates_per_competitor AS (
     SELECT
         COUNTRY,
         COMPETITOR,
-        MAX(CASE WHEN scrape_rank = 1 THEN SCRAPED_DATE END) AS latest_date,
-        MAX(CASE WHEN scrape_rank = 2 THEN SCRAPED_DATE END) AS previous_date
-    FROM ranked_scrapes
+        MAX(CASE WHEN week_rank = 1 THEN week_scraped_date END) AS latest_date,
+        MAX(CASE WHEN week_rank = 2 THEN week_scraped_date END) AS previous_date
+    FROM ranked_weeks
     GROUP BY COUNTRY, COMPETITOR
 ),
 
@@ -111,11 +129,39 @@ chosen_date AS (
         COUNTRY,
         COMPETITOR,
         CASE
-            WHEN latest_date >= DATEADD(day, -5, DATE_TRUNC('week', CURRENT_DATE()))
+            WHEN latest_date >= DATEADD(day, -5, DATE_TRUNC('WEEK', CURRENT_DATE()))
                 THEN previous_date
             ELSE latest_date
         END AS target_scraped_date
     FROM dates_per_competitor
+),
+
+/* Keep only weekly snapshots up to target_scraped_date, take last 5 */
+last_n_weeks AS (
+    SELECT
+        rw.COUNTRY,
+        rw.COMPETITOR,
+        rw.scrape_week_sat,
+        rw.week_scraped_date,
+        ROW_NUMBER() OVER (
+            PARTITION BY rw.COUNTRY, rw.COMPETITOR
+            ORDER BY rw.week_scraped_date DESC
+        ) AS rn
+    FROM ranked_weeks rw
+    JOIN chosen_date cd
+      ON rw.COUNTRY = cd.COUNTRY
+     AND rw.COMPETITOR = cd.COMPETITOR
+     AND rw.week_scraped_date <= cd.target_scraped_date
+),
+
+snapshots AS (
+    SELECT
+        COUNTRY,
+        COMPETITOR,
+        scrape_week_sat,
+        week_scraped_date
+    FROM last_n_weeks
+    WHERE rn <= 4
 ),
 
 count_sku AS (
@@ -132,27 +178,34 @@ count_sku AS (
 SELECT DISTINCT
     d.COMPETITOR,
     d.COUNTRY,
+    s.scrape_week_sat AS scrape_week,
+
+    s.week_scraped_date AS scraped_date,
+
     d.ATTRIBUTES:SKU::STRING      AS SKU,
-    nps.status                   AS STATUS,
-    d.ATTRIBUTES:URL::STRING     AS URL,
-    cs.row_count,
-    cd.target_scraped_date
+    nps.status                    AS STATUS,
+    d.ATTRIBUTES:URL::STRING      AS URL,
+    cs.row_count
 FROM MCP.MARKETPLACE.COMPETITOR_MAPPED_DATA d
-JOIN chosen_date cd
-    ON d.COUNTRY = cd.COUNTRY
-   AND d.COMPETITOR = cd.COMPETITOR
-   AND d.SCRAPED_DATE = cd.target_scraped_date
+JOIN snapshots s
+  ON d.COUNTRY = s.COUNTRY
+ AND d.COMPETITOR = s.COMPETITOR
+ AND d.SCRAPED_DATE = s.week_scraped_date
 LEFT JOIN NP_Status nps
-    ON d.ATTRIBUTES:SKU::STRING = nps.np_sku
+  ON d.ATTRIBUTES:SKU::STRING = nps.np_sku
 JOIN count_sku cs
-  ON d.ATTRIBUTES:SKU = cs.SKU
+  ON d.ATTRIBUTES:SKU::STRING = cs.SKU
  AND d.COMPETITOR = cs.COMPETITOR
- AND cd.target_scraped_date = cs.SCRAPED_DATE
+ AND DATE(d.SCRAPED_DATE) = cs.SCRAPED_DATE
 WHERE d.COUNTRY = %s
   AND nps.status != 'Disabled'
   AND nps.status NOT ILIKE '%%not%%'
-ORDER BY SKU, COMPETITOR
+ORDER BY
+    s.week_scraped_date DESC,
+    SKU,
+    COMPETITOR
 """
+
 
 
 def resultScrapingData(country: str) -> pd.DataFrame:
@@ -175,8 +228,9 @@ def resultScrapingData(country: str) -> pd.DataFrame:
         "URL": "URL",
         "ROW_COUNT": "row_count",
         "COUNTRY": "Country",
-        "TARGET_SCRAPED_DATE": "target_scraped_date",
         "STATUS": "STATUS",
+        "SCRAPE_WEEK": "scrape_week",
+        "SCRAPED_DATE": "scraped_date",
     }
     df_c = df_c.rename(columns={k: v for k, v in rename_map.items() if k in df_c.columns})
 
