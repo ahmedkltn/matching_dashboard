@@ -939,7 +939,6 @@ app.layout = html.Div(
                             children=[
                                 dcc.Loading(type="default", children=dcc.Graph(id="new-skus-history-chart")),
                                 dcc.Loading(type="default", children=dcc.Graph(id="recovered-churned-global-chart")),
-                                dcc.Loading(type="default", children=dcc.Graph(id="competitor-churn-heatmap-chart")),
                             ],
                         ),
                         dcc.Tab(
@@ -1253,7 +1252,6 @@ def load_offline(off_contents, n_fetch, source, country, off_filename):
     # Change detection (global)
     Output("new-skus-history-chart", "figure"),
     Output("recovered-churned-global-chart", "figure"),
-    Output("competitor-churn-heatmap-chart", "figure"),
 
     # Latest competitor chart/table
     Output("comp-volume-chart", "figure"),
