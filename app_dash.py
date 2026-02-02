@@ -34,6 +34,36 @@ _COUNTRY_TOKENS = {
 # CSV parsing / cleaning
 # ============================================================
 
+def filter_offline_weeks_to_looker(off_df: pd.DataFrame, look_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keep only offline rows where scrape_week exists in looker.
+    Looker is the source of truth for the weeks we analyze.
+    """
+    if off_df is None or off_df.empty:
+        return off_df
+    if look_df is None or look_df.empty:
+        # If looker is empty, nothing to match weeks against
+        return off_df.iloc[0:0]
+
+    if "scrape_week" not in off_df.columns or "scrape_week" not in look_df.columns:
+        # If either side doesn't have scrape_week, can't do week intersection safely
+        return off_df.iloc[0:0]
+
+    off_c = off_df.copy()
+    look_c = look_df.copy()
+
+    # Normalize to consistent string keys (avoid object/date mix)
+    off_c["scrape_week"] = off_c["scrape_week"].astype("string").fillna("").astype(str).str.strip()
+    look_c["scrape_week"] = look_c["scrape_week"].astype("string").fillna("").astype(str).str.strip()
+
+    look_weeks = set(look_c.loc[look_c["scrape_week"] != "", "scrape_week"].unique().tolist())
+    if not look_weeks:
+        return off_c.iloc[0:0]
+
+    return off_c[off_c["scrape_week"].isin(look_weeks)].copy()
+
+
+
 def parse_contents(contents: Optional[str]) -> pd.DataFrame:
     if contents is None:
         return pd.DataFrame()
@@ -560,6 +590,7 @@ def loss_history_line(weekly: pd.DataFrame):
         paper_bgcolor="#FFFFFF",
         font=dict(color="#111827"),
     )
+    fig.update_xaxes(type="category")
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(gridcolor="#E5E7EB")
     return fig
@@ -654,6 +685,7 @@ def new_skus_history_chart(new_df: pd.DataFrame):
         font=dict(color="#111827"),
     )
     fig.update_xaxes(showgrid=False)
+    fig.update_xaxes(type="category")
     fig.update_yaxes(gridcolor="#E5E7EB")
     return fig
 
@@ -683,6 +715,7 @@ def recovered_churned_bar(df_rc: pd.DataFrame, title: str):
         font=dict(color="#111827"),
     )
     fig.update_xaxes(showgrid=False)
+    fig.update_xaxes(type="category")
     fig.update_yaxes(gridcolor="#E5E7EB")
     return fig
 
@@ -1293,6 +1326,7 @@ def update_views(off_data, look_data, toggle_value, selected_country):
 
     # Filter offline for metrics
     off_df_for_metrics = apply_remove_invalid_toggle(off_df, remove_invalid)
+    off_df_for_metrics = filter_offline_weeks_to_looker(off_df_for_metrics, look_df)
 
     # Latest week selection
     if "scrape_week" in off_df_for_metrics.columns and off_df_for_metrics["scrape_week"].notna().any():
@@ -1358,7 +1392,6 @@ def update_views(off_data, look_data, toggle_value, selected_country):
 
         new_fig = new_skus_history_chart(new_df)
         rc_fig = recovered_churned_bar(rc_global, "Recovered vs Churned (global) — week over week")
-        churn_heatmap_fig = competitor_churn_heatmap(comp_churn, top_n=40)
 
         # competitor dropdown options for By Competitor tab
         comp_list = sorted(comp_churn["Competitor"].dropna().unique()) if not comp_churn.empty else []
@@ -1367,7 +1400,6 @@ def update_views(off_data, look_data, toggle_value, selected_country):
     else:
         new_fig = {}
         rc_fig = {}
-        churn_heatmap_fig = {}
         change_opts = [{"label": "All competitors", "value": ALL_COMP}]
         change_default = ALL_COMP
 
@@ -1434,7 +1466,6 @@ def update_views(off_data, look_data, toggle_value, selected_country):
         loss_fig,
         new_fig,
         rc_fig,
-        churn_heatmap_fig,
         comp_volume_fig,
         comp_data,
         comp_cols,
@@ -1478,6 +1509,7 @@ def update_change_comp_chart(selected_comp, off_data, look_data, toggle_value):
 
     remove_invalid = bool(toggle_value and "on" in toggle_value)
     off_df_for_metrics = apply_remove_invalid_toggle(off_df, remove_invalid)
+    off_df_for_metrics = filter_offline_weeks_to_looker(off_df_for_metrics, look_df)
 
     comp_churn = compute_competitor_weekly_churn(off_df_for_metrics, look_df, last_n_weeks=4)
     if comp_churn.empty:

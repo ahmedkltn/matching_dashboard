@@ -1,10 +1,14 @@
+# snowflake_client.py
 import os
+from contextlib import contextmanager
+
 import pandas as pd
 import snowflake.connector
 from dotenv import load_dotenv
-from contextlib import contextmanager
 
 load_dotenv()
+
+SCRAPE_WEEK_GRACE_DAYS = 3
 
 
 @contextmanager
@@ -29,14 +33,18 @@ def query_df(sql: str, params: tuple | None = None) -> pd.DataFrame:
     Runs a query and returns a dataframe.
 
     NOTE:
-    When using pd.read_sql with DBAPI parameter style, any literal % in SQL must be escaped as %%.
+    When using pd.read_sql with DBAPI param style, any literal % in SQL must be escaped as %%.
     """
     with snowflake_connection() as conn:
         return pd.read_sql(sql, conn, params=params)
 
 
-RESULT_SCRAPING_DATA_SQL = """
-WITH country_cfg AS (
+RESULT_SCRAPING_DATA_SQL = f"""
+WITH cfg AS (
+    SELECT {SCRAPE_WEEK_GRACE_DAYS} AS grace_days
+),
+
+country_cfg AS (
     SELECT
         UPPER(%s) AS country,
         CASE
@@ -68,8 +76,8 @@ NP_Status AS (
             FROM NATPEN_LAKE_PROD.PIM.PIM_PRODUCTCHANNELS t1
             JOIN NATPEN_LAKE_PROD.PIM.PIM_PRODUCTS t2
                 ON t1.PRODUCTID = t2.PRODUCTID
-            JOIN country_cfg cfg
-                ON t1.channel = cfg.channel
+            JOIN country_cfg cfg2
+                ON t1.channel = cfg2.channel
         ) inn
         FULL JOIN (
             SELECT DISTINCT
@@ -83,19 +91,26 @@ NP_Status AS (
     )
 ),
 
-/* -------- Weekly snapshots aligned to Saturday -------- */
-
+/* -------- Weekly snapshots aligned to Saturday --------
+   IMPORTANT: apply "grace" shift BEFORE bucketing so late scrapes still count for prior week.
+   Without this, a scrape on Tue 27 buckets to Saturday 31, even if it "belongs" to Saturday 24.
+*/
 weekly_scrapes AS (
     SELECT
         d.COUNTRY,
         d.COMPETITOR,
 
-        /* Saturday of that week (to match Looker "Scraped Week Week") */
-        DATEADD(day, 5, DATE_TRUNC('WEEK', d.SCRAPED_DATE)) AS scrape_week_sat,
+        /* Saturday bucket with grace shift */
+        DATEADD(
+            day,
+            5,
+            DATE_TRUNC('WEEK', DATEADD(day, -cfg.grace_days, d.SCRAPED_DATE))
+        ) AS scrape_week_sat,
 
-        /* pick the latest scrape timestamp within that (Saturday-aligned) week bucket */
+        /* pick the latest scrape timestamp within that bucket */
         MAX(d.SCRAPED_DATE) AS week_scraped_date
     FROM MCP.MARKETPLACE.COMPETITOR_MAPPED_DATA d
+    CROSS JOIN cfg
     WHERE d.COUNTRY = %s
     GROUP BY 1, 2, 3
 ),
@@ -136,7 +151,7 @@ chosen_date AS (
     FROM dates_per_competitor
 ),
 
-/* Keep only weekly snapshots up to target_scraped_date, take last 5 */
+/* Keep only weekly snapshots up to target_scraped_date, take last 4 */
 last_n_weeks AS (
     SELECT
         rw.COUNTRY,
@@ -207,7 +222,6 @@ ORDER BY
 """
 
 
-
 def resultScrapingData(country: str) -> pd.DataFrame:
     country = (country or "").strip().upper()
     if not country:
@@ -215,9 +229,9 @@ def resultScrapingData(country: str) -> pd.DataFrame:
 
     # Params order matches %s occurrences:
     # country_cfg: UPPER(%s), CASE UPPER(%s), CASE UPPER(%s)
-    # ranked_scrapes country: %s
-    # count_sku country: %s
-    # final WHERE country: %s
+    # weekly_scrapes: WHERE d.COUNTRY = %s
+    # count_sku: WHERE d.COUNTRY = %s
+    # final WHERE d.COUNTRY = %s
     params = (country, country, country, country, country, country)
 
     df_c = query_df(RESULT_SCRAPING_DATA_SQL, params=params)
