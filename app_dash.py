@@ -181,6 +181,18 @@ def build_comp_key_mapping(offline_keys: list[str], looker_keys: list[str]) -> d
 
     return mapping
 
+def enforce_merge_key_types(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "comp_key" not in df.columns:
+        return df
+    df["comp_key"] = df["comp_key"].astype("string").fillna("").astype(str)
+
+    if "SKU" in df.columns:
+        df["SKU"] = df["SKU"].astype("string").fillna("").astype(str)
+    return df
+
+
+
 
 def align_competitors(off_df: pd.DataFrame, look_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
@@ -192,6 +204,10 @@ def align_competitors(off_df: pd.DataFrame, look_df: pd.DataFrame) -> Tuple[pd.D
 
     off_df["comp_key"] = off_df["Competitor"].apply(normalize_competitor_name)
     look_df["comp_key"] = look_df["Competitor"].apply(normalize_competitor_name)
+
+
+    off_df = enforce_merge_key_types(off_df)
+    look_df = enforce_merge_key_types(look_df)
 
     offline_keys = sorted(off_df["comp_key"].dropna().unique())
     looker_keys = sorted(look_df["comp_key"].dropna().unique())
@@ -245,7 +261,11 @@ def _build_status_table(off_df: pd.DataFrame, look_df: pd.DataFrame, weeks: list
 # ============================================================
 
 def compute_metrics_latest(off_df_latest: pd.DataFrame, look_df_latest: pd.DataFrame):
+
     off_df_latest, look_df_latest, unmatched_offline = align_competitors(off_df_latest, look_df_latest)
+
+    off_df_latest = enforce_merge_key_types(off_df_latest)
+    look_df_latest = enforce_merge_key_types(look_df_latest)
 
     look_slim = look_df_latest[["comp_key", "SKU", "Competitor"]].rename(columns={"Competitor": "Competitor_Looker"})
 
@@ -342,24 +362,32 @@ def compute_weekly_loss_series(off_df: pd.DataFrame, look_df: pd.DataFrame, last
 
 def compute_new_pairs_over_time(off_df: pd.DataFrame, last_n_weeks: int = 4) -> pd.DataFrame:
     """
-    New pairs each week:
-      new_pairs(week) = pairs in week not seen in any previous week (within the window).
+    New pairs each week (excluding the first week in the window).
+
+    We treat the earliest week as baseline, so we DON'T plot it.
+    For week i>0: new_pairs = pairs in week i not seen in any previous week in the window.
     """
     if off_df is None or off_df.empty or "scrape_week" not in off_df.columns:
         return pd.DataFrame(columns=["scrape_week", "new_pairs"])
 
     weeks = _weeks_last_n(off_df, last_n_weeks)
-    if not weeks:
+    if len(weeks) < 2:
+        # Not enough history to compute "new" beyond a baseline
         return pd.DataFrame(columns=["scrape_week", "new_pairs"])
 
     df_c = off_df[off_df["scrape_week"].isin(weeks)].copy()
     df_c["comp_key"] = df_c["Competitor"].apply(normalize_competitor_name)
     df_c = df_c[["scrape_week", "comp_key", "SKU"]].drop_duplicates()
 
-    seen_prev: set[tuple[str, str]] = set()
-    rows = []
+    weeks_sorted = sorted(weeks)
 
-    for w in sorted(weeks):
+    # Baseline: first week pairs are "known", but not counted as "new"
+    base_week = weeks_sorted[0]
+    base_pairs = df_c[df_c["scrape_week"] == base_week][["comp_key", "SKU"]]
+    seen_prev: set[tuple[str, str]] = set(map(tuple, base_pairs.values.tolist()))
+
+    rows = []
+    for w in weeks_sorted[1:]:
         week_pairs = df_c[df_c["scrape_week"] == w][["comp_key", "SKU"]]
         pairs = set(map(tuple, week_pairs.values.tolist()))
         new_pairs = pairs - seen_prev
@@ -367,6 +395,7 @@ def compute_new_pairs_over_time(off_df: pd.DataFrame, last_n_weeks: int = 4) -> 
         seen_prev |= pairs
 
     return pd.DataFrame(rows)
+
 
 
 def compute_recovered_churn_global(off_df: pd.DataFrame, look_df: pd.DataFrame, last_n_weeks: int = 4) -> pd.DataFrame:
@@ -1097,6 +1126,7 @@ def toggle_offline_source_ui(source):
 )
 def load_looker(contents):
     df_c = clean_df(parse_contents(contents))
+    df_c = df_c.drop(columns=["comp_key"], errors="ignore")
     return df_c.to_dict("records")
 
 
@@ -1138,6 +1168,7 @@ def load_offline(off_contents, n_fetch, source, country, off_filename):
         if off_contents is None:
             return no_update, "Waiting for offline upload...", "", no_update
         df_c = clean_df(parse_contents(off_contents))
+        df_c = df_c.drop(columns=["comp_key"], errors="ignore")
         name = off_filename or "offline.csv"
         selected_country = derive_selected_country_from_df(df_c)
         return df_c.to_dict("records"), f"Offline loaded from upload: {name} ({len(df_c)} rows)", "", selected_country
@@ -1162,6 +1193,7 @@ def load_offline(off_contents, n_fetch, source, country, off_filename):
         try:
             df_c = resultScrapingData(country)
             df_c = clean_df(df_c)
+            df_c = df_c.drop(columns=["comp_key"], errors="ignore")
             records = df_c.to_dict("records")
             _cache_set(country, records)
             return (
@@ -1382,7 +1414,7 @@ def update_views(off_data, look_data, toggle_value, selected_country):
 
     # New SKUs latest table
     if "scrape_week" in off_df_for_metrics.columns:
-        new_skus_df = compute_new_skus_latest(off_df_for_metrics, last_n_weeks=3)
+        new_skus_df = compute_new_skus_latest(off_df_for_metrics, last_n_weeks=4)
         if new_skus_df.empty:
             new_note = "No new SKUs found for latest week (or not enough history)."
             new_data = []
