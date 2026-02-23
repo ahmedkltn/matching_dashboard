@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SCRAPE_WEEK_GRACE_DAYS = 3
+SCRAPE_WEEK_GRACE_DAYS = 5
 
 
 @contextmanager
