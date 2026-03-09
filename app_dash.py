@@ -34,6 +34,27 @@ _COUNTRY_TOKENS = {
 # CSV parsing / cleaning
 # ============================================================
 
+def apply_apparel_suffix_to_looker(df: pd.DataFrame, enabled: bool) -> pd.DataFrame:
+    """
+    If enabled, append '__apparel' to all Looker competitor names
+    before alignment / joining.
+    """
+    if df is None or df.empty or not enabled:
+        return df
+
+    df_c = df.copy()
+    if "Competitor" not in df_c.columns:
+        return df_c
+
+    df_c["Competitor"] = (
+        df_c["Competitor"]
+        .astype(str)
+        .str.strip()
+        .apply(lambda x: f"{x}__apparel" if x else x)
+    )
+    return df_c
+
+
 def filter_offline_weeks_to_looker(off_df: pd.DataFrame, look_df: pd.DataFrame) -> pd.DataFrame:
     """
     Keep only offline rows where scrape_week exists in looker.
@@ -899,6 +920,12 @@ app.layout = html.Div(
                             value=["on"],
                             labelStyle={"display": "inline-block", "marginRight": "12px"},
                         ),
+                        dcc.Checklist(
+                            id="toggle-apparel",
+                            options=[{"label": "Apparel mode (append '__apparel' to all Looker competitors)", "value": "on"}],
+                            value=[],
+                            labelStyle={"display": "inline-block", "marginRight": "12px", "marginTop": "8px"},
+                        ),
                     ],
                     className="card",
                     style={"padding": "10px 12px"},
@@ -1289,10 +1316,14 @@ def load_offline(off_contents, n_fetch, source, country, off_filename):
     Input("looker-data", "data"),
     Input("toggle-remove-invalid", "value"),
     Input("selected-country", "data"),
+    Input("toggle-apparel", "value"),
 )
-def update_views(off_data, look_data, toggle_value, selected_country):
+def update_views(off_data, look_data, toggle_value, selected_country,apparel_value):
     off_df = pd.DataFrame(off_data or [])
     look_df = pd.DataFrame(look_data or [])
+
+    apparel_enabled = bool(apparel_value and "on" in apparel_value)
+    look_df = apply_apparel_suffix_to_looker(look_df, apparel_enabled)
 
     # Empty state
     if off_df.empty or look_df.empty:
@@ -1497,10 +1528,13 @@ def update_views(off_data, look_data, toggle_value, selected_country):
     State("offline-data", "data"),
     State("looker-data", "data"),
     State("toggle-remove-invalid", "value"),
+    State("toggle-apparel", "value"),
 )
-def update_change_comp_chart(selected_comp, off_data, look_data, toggle_value):
+def update_change_comp_chart(selected_comp, off_data, look_data, toggle_value, apparel_value):
     off_df = pd.DataFrame(off_data or [])
     look_df = pd.DataFrame(look_data or [])
+    apparel_enabled = bool(apparel_value and "on" in apparel_value)
+    look_df = apply_apparel_suffix_to_looker(look_df, apparel_enabled)
 
     if off_df.empty or look_df.empty or "scrape_week" not in off_df.columns or "scrape_week" not in look_df.columns:
         return {}
@@ -1539,15 +1573,20 @@ def update_change_comp_chart(selected_comp, off_data, look_data, toggle_value):
     State("offline-data", "data"),
     State("looker-data", "data"),
     State("toggle-remove-invalid", "value"),
+    State("toggle-apparel", "value"),
 )
-def update_drilldown(selected_comp, off_data, look_data, toggle_value):
+def update_drilldown(selected_comp, off_data, look_data, toggle_value, apparel_value):
     if not selected_comp:
         return [], []
 
     off_df = pd.DataFrame(off_data or [])
     look_df = pd.DataFrame(look_data or [])
+
     if off_df.empty or look_df.empty:
         return [], []
+    
+    apparel_enabled = bool(apparel_value and "on" in apparel_value)
+    look_df = apply_apparel_suffix_to_looker(look_df, apparel_enabled)
 
     remove_invalid = bool(toggle_value and "on" in toggle_value)
     off_df_for_metrics = apply_remove_invalid_toggle(off_df, remove_invalid)
